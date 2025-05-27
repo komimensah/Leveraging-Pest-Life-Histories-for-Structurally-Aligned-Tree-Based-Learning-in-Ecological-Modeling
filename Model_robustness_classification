@@ -1,0 +1,203 @@
+# ===========================================
+# 🔁 Generalization Simulation for BioCAT Model (Extended Version)
+# ===========================================
+
+# Load libraries
+library(xgboost)
+library(randomForest)
+library(rpart)
+library(dplyr)
+library(caret)
+library(tidyr)
+library(ggplot2)
+
+# Gain function constructors
+create_exp_gain <- function(thresh = 0.6, scale = 2) {
+  function(r) exp(scale * (r - thresh))
+}
+
+create_sigmoid_gain <- function(midpoint = 0.6, slope = 10) {
+  function(r) 1 / (1 + exp(-slope * (r - midpoint)))
+}
+
+create_step_gain <- function(low = 0.4, high = 0.7, low_w = 0.6, high_w = 1.4, mid_w = 1.0) {
+  function(r) ifelse(r < low, low_w, ifelse(r > high, high_w, mid_w))
+}
+
+create_triangular_gain <- function(a = 0.5, b = 0.8, peak = 0.65, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r <= a | r >= b, min_w,
+                     ifelse(r <= peak, max_w * (r - a) / (peak - a),
+                            max_w * (b - r) / (b - peak)))
+}
+
+create_trapezoidal_gain <- function(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r < start | r > end, min_w,
+                     ifelse(r < flat_start, max_w * (r - start) / (flat_start - start),
+                            ifelse(r < flat_end, max_w, max_w * (end - r) / (end - flat_end))))
+}
+
+create_gaussian_gain <- function(mu = 0.65, sigma = 0.1) {
+  function(r) exp(-((r - mu)^2) / (2 * sigma^2))
+}
+
+# Initialize storage
+results_summary <- data.frame()
+all_accuracies <- data.frame()
+
+# Repeat simulation for N datasets
+set.seed(42)
+N <- 100
+for (i in 1:N) {
+  set.seed(1000 + i)  # Ensures reproducibility for each simulation
+  n <- sample(100:500, 1)
+  p <- sample(5:10, 1)
+  set.seed(2000 + i)
+  env_vars <- as.data.frame(matrix(rnorm(n * p, mean = 0, sd = 1), ncol = p))
+  colnames(env_vars) <- paste0("Var", 1:p)
+  
+  set.seed(3000 + i)
+  risk_index <- runif(n)
+  target_raw <- 2.5 * env_vars[, 1] - 1.3 * env_vars[, p] + sin(env_vars[, 2]) + 2 * risk_index + rnorm(n, 0, 1)
+  
+  breaks <- quantile(target_raw, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  moth_count <- cut(target_raw, breaks = breaks, include.lowest = TRUE, labels = c(0, 1, 2))
+  moth_count <- as.integer(as.character(moth_count))
+  
+  index <- createDataPartition(moth_count, p = 0.8, list = FALSE)
+  X_train <- env_vars[index, ]
+  X_test <- env_vars[-index, ]
+  y_train <- moth_count[index]
+  y_test <- moth_count[-index]
+  risk_train <- risk_index[index]
+  
+  mu <- median(risk_train)
+  sigma <- IQR(risk_train) / 2
+  q40 <- quantile(risk_train, 0.4)
+  q60 <- quantile(risk_train, 0.6)
+  q80 <- quantile(risk_train, 0.8)
+  
+  weighting_strategies <- list(
+    EXP = create_exp_gain(thresh = q60),
+    SIGMOID = create_sigmoid_gain(midpoint = mu),
+    STEP = create_step_gain(low = q40, high = q80),
+    TRIANGULAR = create_triangular_gain(a = q40, b = q80, peak = mu),
+    TRAPEZOID = create_trapezoidal_gain(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75),
+    GAUSSIAN = create_gaussian_gain(mu = mu, sigma = sigma)
+  )
+  
+  dtest <- xgb.DMatrix(data = as.matrix(X_test))
+  
+  base_models <- list()
+  base_acc <- list()
+  
+  base_models$RandomForest <- randomForest(x = X_train, y = as.factor(y_train), ntree = 200)
+  base_acc$RandomForest <- mean(predict(base_models$RandomForest, X_test) == y_test)
+  
+  base_models$DecisionTree <- rpart(as.factor(y_train) ~ ., data = X_train, method = "class")
+  base_acc$DecisionTree <- mean(predict(base_models$DecisionTree, X_test, type = "class") == y_test)
+  
+  dtrain_plain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  base_models$XGBoost <- xgboost(data = dtrain_plain, nrounds = 100, objective = "multi:softmax",
+                                 num_class = 3, verbose = 0)
+  base_acc$XGBoost <- mean(predict(base_models$XGBoost, dtest) == y_test)
+  
+  for (label in names(weighting_strategies)) {
+    weights <- weighting_strategies[[label]](risk_train)
+    dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train, weight = weights)
+    model <- xgboost(data = dtrain, nrounds = 100, objective = "multi:softmax",
+                     num_class = 3, verbose = 0)
+    acc <- mean(predict(model, dtest) == y_test)
+    base_acc[[paste0("BioCATXGBoost_", label)]] <- acc
+  }
+  
+  acc_vec <- unlist(base_acc)
+  rank_vec <- rank(-acc_vec, ties.method = "min")
+  top1 <- any(grepl("BioCATXGBoost", names(rank_vec[rank_vec == 1])))
+  top2 <- any(grepl("BioCATXGBoost", names(rank_vec[rank_vec <= 2])))
+  
+  results_summary <- rbind(results_summary, data.frame(Run = i, Top1 = top1, Top2 = top2))
+  
+  acc_df <- data.frame(Run = i, Model = names(acc_vec), Accuracy = acc_vec)
+  all_accuracies <- rbind(all_accuracies, acc_df)
+}
+
+# ============================
+# 📊 Supplementary Accuracy Plots
+# ============================
+
+all_accuracies$RunGroup <- cut(all_accuracies$Run, breaks = seq(0, N, length.out = 11), labels = paste0("Group", 1:10), include.lowest = TRUE)
+
+acc_split <- split(all_accuracies, all_accuracies$RunGroup)
+
+pdf("Supplementary_Accuracy_IndividualPlots.pdf", width = 12, height = 8)
+for (g in names(acc_split)) {
+  p <- ggplot(acc_split[[g]], aes(x = Run, y = Accuracy, color = Model)) +
+    geom_point(alpha = 0.6, size = 1.8) +
+    geom_line(aes(group = Model), alpha = 0.3) +
+    facet_wrap(~Model, ncol = 4) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Accuracy per Model -", g), x = "Simulation Run", y = "Accuracy") +
+    theme(
+      axis.line = element_line(color = "black", linewidth = 0.8),
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks = element_line(color = "black")
+    )
+  print(p)
+}
+dev.off()
+
+# ============================
+# 📊 Summary Output
+# ============================
+prop_top1 <- mean(results_summary$Top1)
+prop_top2 <- mean(results_summary$Top2)
+cat("
+BioCATXGBoost was best model in:", round(prop_top1 * 100, 1), "% of runs
+")
+cat("BioCATXGBoost was among top 2 models in:", round(prop_top2 * 100, 1), "% of runs
+")
+
+# Additional metric: how often any BioCAT model outperformed standard XGBoost
+xgb_vs_biocat <- all_accuracies %>%
+  filter(grepl("BioCATXGBoost", Model) | Model == "XGBoost") %>%
+  group_by(Run) %>%
+  summarise(BioCAT_Better = any(Accuracy[Model != "XGBoost"] > Accuracy[Model == "XGBoost"]))
+
+prop_better_than_xgb <- mean(xgb_vs_biocat$BioCAT_Better)
+cat("BioCATXGBoost outperformed plain XGBoost in:", round(prop_better_than_xgb * 100, 1), "% of runs
+")
+
+# Plot percentage summary
+summary_df <- data.frame(
+  Category = c("Best Model", "Top 2 Model", "Better Than XGBoost"),
+  Percent = c(prop_top1, prop_top2, prop_better_than_xgb) * 100
+)
+
+ggplot(summary_df, aes(x = Category, y = Percent, fill = Category)) +
+  geom_col(width = 0.6, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Performance of BioCATXGBoost Across Random Datasets",
+       y = "% of Runs", x = "") +
+  theme(
+    legend.position = "none",
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks = element_line(color = "black")
+  )
+
+# Boxplot of all accuracies
+all_accuracies$Type <- ifelse(grepl("BioCAT", all_accuracies$Model), "BioCATXGBoost", "Other Models")
+
+ggplot(all_accuracies, aes(x = Model, y = Accuracy, fill = Type)) +
+  geom_boxplot(outlier.size = 0.7, outlier.alpha = 0.3) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Accuracy Distribution Across Models", y = "Accuracy", x = "Model") +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks = element_line(color = "black")
+  )
