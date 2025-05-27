@@ -1,0 +1,199 @@
+# ======================
+# 📦 Libraries
+library(data.table)
+library(dplyr)
+library(caret)
+library(xgboost)
+library(lightgbm)
+library(randomForest)
+library(rpart)
+library(ggplot2)
+library(tidyr)
+library(grid)
+
+# =========================
+# 📂 Load and Preprocess
+# =========================
+set.seed(42)
+data <- fread("/Users/kagboka/Desktop/Franck_work/BPHoutput.csv")
+
+# --- Target variable for regression ---
+y <- data$sampled.bph  # numeric, continuous response
+
+# --- Risk Index Normalization ---
+data$Risk_Index <- pmin(pmax(data$Risk_function_Norm, 0.01), 1.0)
+
+# --- Feature selection ---
+base_features <- c("T2M_MAX" , "T2M_MIN", "PRECTOT", "RH2M", "Temp_Avg")
+     
+X <- as.data.frame(data[, ..base_features]) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+# --- Train-Test Split ---
+train_index <- createDataPartition(y, p = 0.6, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+risk_train <- data$Risk_Index[train_index]
+
+# ===========================
+# 📈 Tunable Gain Functions
+# ===========================
+mu <- median(risk_train)
+sigma <- IQR(risk_train) / 2
+q40 <- quantile(risk_train, 0.4)
+q60 <- quantile(risk_train, 0.6)
+q80 <- quantile(risk_train, 0.8)
+
+create_exp_gain <- function(thresh = 0.6, scale = 2) {
+  function(r) exp(scale * (r - thresh))
+}
+create_sigmoid_gain <- function(midpoint = 0.6, slope = 10) {
+  function(r) 1 / (1 + exp(-slope * (r - midpoint)))
+}
+create_step_gain <- function(low = 0.4, high = 0.7, low_w = 0.6, high_w = 1.4, mid_w = 1.0) {
+  function(r) ifelse(r < low, low_w, ifelse(r > high, high_w, mid_w))
+}
+create_triangular_gain <- function(a = 0.5, b = 0.8, peak = 0.65, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r <= a | r >= b, min_w,
+                     ifelse(r <= peak, max_w * (r - a) / (peak - a),
+                            max_w * (b - r) / (b - peak)))
+}
+create_trapezoidal_gain <- function(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r < start | r > end, min_w,
+                     ifelse(r < flat_start, max_w * (r - start) / (flat_start - start),
+                            ifelse(r < flat_end, max_w, max_w * (end - r) / (end - flat_end))))
+}
+create_gaussian_gain <- function(mu = 0.65, sigma = 0.1) {
+  function(r) exp(-((r - mu)^2) / (2 * sigma^2))
+}
+
+weighting_strategies <- list(
+  EXP = create_exp_gain(thresh = q60),
+  SIGMOID = create_sigmoid_gain(midpoint = mu),
+  STEP = create_step_gain(low = q40, high = q80),
+  TRIANGULAR = create_triangular_gain(a = q40, b = q80, peak = mu),
+  TRAPEZOID = create_trapezoidal_gain(),
+  GAUSSIAN = create_gaussian_gain(mu = mu, sigma = sigma)
+)
+
+# =========================
+# 📊 Plot Gain Functions
+# =========================
+
+# Create a sequence of risk index values from 0 to 1
+r_seq <- seq(0, 1, 0.01)
+gain_df <- data.frame(r = r_seq)
+
+# Evaluate each gain function on the sequence
+for (label in names(weighting_strategies)) {
+  gain_df[[label]] <- weighting_strategies[[label]](r_seq)
+}
+
+# Convert to long format for ggplot
+gain_df_long <- pivot_longer(gain_df, -r, names_to = "Function", values_to = "Weight")
+
+# Plot all gain functions together
+ggplot(gain_df_long, aes(x = r, y = Weight, color = Function, linetype = Function)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash", "twodash", "longdash")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "right",
+    legend.title = element_blank(),
+    plot.margin = unit(c(1, 1, 1, 1), "lines")
+  ) +
+  labs(
+    x = expression(BPH~Risk~Index~(italic(r))),
+    y = "Sample Weight",
+    title = ""
+  )
+
+# ======================
+# 📏 Regression Metrics
+# ======================
+regression_metrics <- function(pred, actual) {
+  r2 <- cor(pred, actual)^2
+  rmse <- sqrt(mean((pred - actual)^2))
+  return(c(R2 = r2, RMSE = rmse))
+}
+
+# ======================
+# 🚀 Fixed-Input Models
+# ======================
+results_df <- data.frame()
+
+# Random Forest
+rf <- randomForest(x = X_train, y = y_train, ntree = 300, maxnodes = 10)
+pred_rf <- predict(rf, X_test)
+m <- regression_metrics(pred_rf, y_test)
+results_df <- rbind(results_df, data.frame(Scenario = "BASE", Model = "Random Forest", R2 = m["R2"], RMSE = m["RMSE"]))
+
+# LightGBM
+lgb_train <- lgb.Dataset(data = as.matrix(X_train), label = y_train)
+lgb_model <- lgb.train(params = list(objective = "regression", learning_rate = 0.1,
+                                     max_depth = 10, num_leaves = 31, seed = 42),
+                       data = lgb_train, nrounds = 300)
+pred_lgb <- predict(lgb_model, as.matrix(X_test))
+m <- regression_metrics(pred_lgb, y_test)
+results_df <- rbind(results_df, data.frame(Scenario = "BASE", Model = "LightGBM", R2 = m["R2"], RMSE = m["RMSE"]))
+
+# Decision Tree
+tree_model <- rpart(y_train ~ ., data = X_train, method = "anova", control = rpart.control(maxdepth = 10))
+pred_tree <- predict(tree_model, X_test)
+m <- regression_metrics(pred_tree, y_test)
+results_df <- rbind(results_df, data.frame(Scenario = "BASE", Model = "Decision Tree", R2 = m["R2"], RMSE = m["RMSE"]))
+
+# XGBoost (Plain)
+dtrain_plain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(X_test))
+xgb_model_plain <- xgboost(data = dtrain_plain, nrounds = 300, objective = "reg:squarederror",
+                           max_depth = 10, eta = 0.1, subsample = 0.8, verbose = 0)
+pred_xgb_plain <- predict(xgb_model_plain, dtest)
+m <- regression_metrics(pred_xgb_plain, y_test)
+results_df <- rbind(results_df, data.frame(Scenario = "BASE", Model = "XGBoost", R2 = m["R2"], RMSE = m["RMSE"]))
+
+# ======================
+# 🔁 BioCATXGBoost (Weighted)
+# ======================
+for (label in names(weighting_strategies)) {
+  gain_func <- weighting_strategies[[label]]
+  sample_weights <- gain_func(risk_train)
+  
+  dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train, weight = sample_weights)
+  dtest <- xgb.DMatrix(data = as.matrix(X_test))
+  
+  xgb_model <- xgboost(data = dtrain, nrounds = 300, objective = "reg:squarederror",
+                       max_depth = 10, eta = 0.1, subsample = 0.8, verbose = 0)
+  pred_xgb <- predict(xgb_model, dtest)
+  m <- regression_metrics(pred_xgb, y_test)
+  
+  results_df <- rbind(results_df, data.frame(Scenario = label,
+                                             Model = paste0("BioCATXGBoost (", label, ")"),
+                                             R2 = m["R2"], RMSE = m["RMSE"]))
+}
+
+# ======================
+# 📊 Output
+# ======================
+results_df <- results_df %>% arrange(Scenario, desc(R2))
+print(results_df)
+
+
+ggplot(results_df, aes(x = Model, y = R2, fill = Scenario)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "BPH Regression Performance",
+       y = expression(R^2), x = "Model") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    legend.position = "right"
+  )
+nrow(data)
