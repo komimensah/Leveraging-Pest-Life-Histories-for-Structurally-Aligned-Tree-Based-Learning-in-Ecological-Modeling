@@ -1,0 +1,194 @@
+# ===========================================
+# 🔁 Generalization Simulation for BioCAT Model (Regression Version)
+# ===========================================
+
+# Load libraries
+library(xgboost)
+library(randomForest)
+library(rpart)
+library(dplyr)
+library(caret)
+library(tidyr)
+library(ggplot2)
+
+# Gain function constructors
+create_exp_gain <- function(thresh = 0.6, scale = 2) {
+  function(r) exp(scale * (r - thresh))
+}
+
+create_sigmoid_gain <- function(midpoint = 0.6, slope = 10) {
+  function(r) 1 / (1 + exp(-slope * (r - midpoint)))
+}
+
+create_step_gain <- function(low = 0.4, high = 0.7, low_w = 0.6, high_w = 1.4, mid_w = 1.0) {
+  function(r) ifelse(r < low, low_w, ifelse(r > high, high_w, mid_w))
+}
+
+create_triangular_gain <- function(a = 0.5, b = 0.8, peak = 0.65, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r <= a | r >= b, min_w,
+                     ifelse(r <= peak, max_w * (r - a) / (peak - a),
+                            max_w * (b - r) / (b - peak)))
+}
+
+create_trapezoidal_gain <- function(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r < start | r > end, min_w,
+                     ifelse(r < flat_start, max_w * (r - start) / (flat_start - start),
+                            ifelse(r < flat_end, max_w, max_w * (end - r) / (end - flat_end))))
+}
+
+create_gaussian_gain <- function(mu = 0.65, sigma = 0.1) {
+  function(r) exp(-((r - mu)^2) / (2 * sigma^2))
+}
+
+results_summary <- data.frame()
+all_metrics <- data.frame()
+
+set.seed(42)
+N <- 100
+for (i in 1:N) {
+  set.seed(1000 + i)
+  n <- sample(50:100, 1)
+  p <- sample(5:10, 1)
+  set.seed(2000 + i)
+  env_vars <- as.data.frame(matrix(rnorm(n * p, mean = 0, sd = 1), ncol = p))
+  colnames(env_vars) <- paste0("Var", 1:p)
+  
+  set.seed(3000 + i)
+  risk_index <- runif(n)
+  target_raw <- 2.5 * env_vars[, 1] - 1.3 * env_vars[, p] + sin(env_vars[, 2]) + 2 * risk_index + rnorm(n, 0, 1)
+  
+  index <- createDataPartition(target_raw, p = 0.8, list = FALSE)
+  X_train <- env_vars[index, ]
+  X_test <- env_vars[-index, ]
+  y_train <- target_raw[index]
+  y_test <- target_raw[-index]
+  risk_train <- risk_index[index]
+  
+  mu <- median(risk_train)
+  sigma <- IQR(risk_train) / 2
+  q40 <- quantile(risk_train, 0.4)
+  q60 <- quantile(risk_train, 0.6)
+  q80 <- quantile(risk_train, 0.8)
+  
+  weighting_strategies <- list(
+    EXP = create_exp_gain(thresh = q60),
+    SIGMOID = create_sigmoid_gain(midpoint = mu),
+    STEP = create_step_gain(low = q40, high = q80),
+    TRIANGULAR = create_triangular_gain(a = q40, b = q80, peak = mu),
+    TRAPEZOID = create_trapezoidal_gain(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75),
+    GAUSSIAN = create_gaussian_gain(mu = mu, sigma = sigma)
+  )
+  
+  dtest <- xgb.DMatrix(data = as.matrix(X_test))
+  metrics <- list()
+  
+  # RF
+  rf <- randomForest(x = X_train, y = y_train, ntree = 200)
+  pred_rf <- predict(rf, X_test)
+  metrics$RandomForest <- c(RMSE = sqrt(mean((pred_rf - y_test)^2)), R2 = cor(pred_rf, y_test)^2)
+  
+  # DT
+  tree <- rpart(y_train ~ ., data = X_train, method = "anova")
+  pred_tree <- predict(tree, X_test)
+  metrics$DecisionTree <- c(RMSE = sqrt(mean((pred_tree - y_test)^2)), R2 = cor(pred_tree, y_test)^2)
+  
+  # XGB plain
+  dtrain_plain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  xgb_plain <- xgboost(data = dtrain_plain, nrounds = 100, objective = "reg:squarederror", verbose = 0)
+  pred_xgb_plain <- predict(xgb_plain, dtest)
+  metrics$XGBoost <- c(RMSE = sqrt(mean((pred_xgb_plain - y_test)^2)), R2 = cor(pred_xgb_plain, y_test)^2)
+  
+  # BioCATXGBoost
+  for (label in names(weighting_strategies)) {
+    weights <- weighting_strategies[[label]](risk_train)
+    dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train, weight = weights)
+    model <- xgboost(data = dtrain, nrounds = 100, objective = "reg:squarederror", verbose = 0)
+    pred <- predict(model, dtest)
+    metrics[[paste0("BioCATXGBoost_", label)]] <- c(RMSE = sqrt(mean((pred - y_test)^2)), R2 = cor(pred, y_test)^2)
+  }
+  
+  metric_df <- do.call(rbind, metrics) %>% as.data.frame()
+  metric_df$Model <- rownames(metric_df)
+  metric_df$Run <- i
+  rownames(metric_df) <- NULL
+  all_metrics <- rbind(all_metrics, metric_df)
+}
+
+# ============================
+# 📊 Plot
+# ============================
+all_metrics_long <- pivot_longer(all_metrics, cols = c("RMSE", "R2"), names_to = "Metric", values_to = "Value")
+all_metrics_long$Type <- ifelse(grepl("BioCAT", all_metrics_long$Model), "BioCATXGBoost", "Other Models")
+
+# Boxplot
+ggplot(all_metrics_long, aes(x = Model, y = Value, fill = Type)) +
+  geom_boxplot(outlier.size = 0.7, outlier.alpha = 0.3) +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks = element_line(color = "black")
+  ) +
+  labs(title = "Regression Performance: RMSE and R² across Models")
+library(gridExtra)
+supp_r2 <- all_metrics %>% select(Run, Model, R2)
+supp_r2$Type <- ifelse(grepl("BioCAT", supp_r2$Model), "BioCATXGBoost", "Other")
+supp_r2$Group <- cut(supp_r2$Run, breaks = seq(0, N, length.out = 11), labels = paste0("Group", 1:10), include.lowest = TRUE)
+
+pdf("Supplementary_R2_IndividualPlots.pdf", width = 12, height = 8)
+for (g in unique(supp_r2$Group)) {
+  df <- supp_r2[supp_r2$Group == g, ]
+  p <- ggplot(df, aes(x = Run, y = R2, color = Model)) +
+    geom_point(alpha = 0.7, size = 1.5) +
+    geom_line(aes(group = Model), alpha = 0.3) +
+    facet_wrap(~Model, ncol = 4) +
+    theme_minimal(base_size = 13) +
+    labs(title = paste("Supplementary R² by Simulation -", g), y = "R²", x = "Simulation") +
+    theme(
+      axis.line = element_line(color = "black", linewidth = 0.8),
+      panel.grid = element_blank(),
+      axis.ticks = element_line(color = "black")
+    )
+  print(p)
+}
+dev.off()
+
+# ============================
+# 📌 Summary Statistics for R²
+# ============================
+
+# Identify top 2 R² models per run
+top_r2_summary <- all_metrics %>%
+  group_by(Run) %>%
+  arrange(desc(R2)) %>%
+  mutate(Rank = row_number()) %>%
+  ungroup()
+
+# Count number of times a BioCATXGBoost model is rank 1 (best)
+top1_biocat_r2 <- top_r2_summary %>%
+  filter(Rank == 1, grepl("BioCAT", Model)) %>%
+  nrow()
+
+# Count number of times a BioCATXGBoost model is in top 2
+top2_biocat_r2 <- top_r2_summary %>%
+  filter(Rank <= 2, grepl("BioCAT", Model)) %>%
+  group_by(Run) %>%
+  summarise(BioCAT_in_top2 = any(grepl("BioCAT", Model))) %>%
+  summarise(count = sum(BioCAT_in_top2)) %>%
+  pull(count)
+
+# Count number of times any BioCATXGBoost outperformed plain XGBoost
+xgb_vs_biocat_r2 <- all_metrics %>%
+  filter(grepl("BioCAT", Model) | Model == "XGBoost") %>%
+  group_by(Run) %>%
+  summarise(BioCAT_Better = any(R2[Model != "XGBoost"] > R2[Model == "XGBoost"])) %>%
+  summarise(count = sum(BioCAT_Better)) %>%
+  pull(count)
+
+# Report results
+cat("BioCATXGBoost was the best R² model in:", top1_biocat_r2, "of", N, "runs (", round(100 * top1_biocat_r2/N, 1), "%)\n")
+cat("BioCATXGBoost was among top 2 R² models in:", top2_biocat_r2, "of", N, "runs (", round(100 * top2_biocat_r2/N, 1), "%)\n")
+cat("BioCATXGBoost outperformed plain XGBoost in R² in:", xgb_vs_biocat_r2, "of", N, "runs (", round(100 * xgb_vs_biocat_r2/N, 1), "%)\n")
