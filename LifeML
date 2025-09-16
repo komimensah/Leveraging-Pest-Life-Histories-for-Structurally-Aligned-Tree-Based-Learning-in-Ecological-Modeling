@@ -1,0 +1,290 @@
+# ======================
+# 📦 Libraries
+# ======================
+library(data.table)
+library(dplyr)
+library(caret)
+library(xgboost)
+library(lightgbm)
+library(randomForest)
+library(rpart)
+library(ggplot2)
+library(tidyr)
+library(grid)
+# ======================
+# 📂 Load and Preprocess
+# ======================
+set.seed(42)
+data <- fread("/Users/kagboka/Desktop/Franck_work/komioutput.csv")
+summary(data)
+# Moth class labels
+# Preferred: Fixed quantile-based bins (25%, 50%, 75%)
+quantile_probs <- c(0, 0.25, 0.5, 0.75, 1)
+q <- quantile(data$Busseola_fusca, probs = quantile_probs, na.rm = TRUE)
+
+# Remove duplicate breakpoints
+q_unique <- unique(q)
+
+# Decide how many bins you *wanted*
+n_bins <- length(quantile_probs) - 1
+
+# Label vector: c(0, 1, 2, 3) for 4 bins; adjust based on actual bins
+labels <- 0:(length(q_unique) - 2)
+
+if (length(q_unique) >= 3) {
+  # ✅ Use quantile-based bins
+  data$moth_class_label <- cut(data$Busseola_fusca,
+                               breaks = q_unique,
+                               labels = labels,
+                               include.lowest = TRUE,
+                               right = TRUE)
+  message("Class labels assigned using quantile-based bins.")
+} else {
+  # ❗ Fallback: equal-width binning if quantiles are not usable
+  data$moth_class_label <- cut(data$Busseola_fusca,
+                               breaks = n_bins,
+                               labels = 0:(n_bins - 1),
+                               include.lowest = TRUE)
+  warning("Quantile breaks were not unique; fallback to equal-width binning.")
+}
+
+
+# Replace with your raw lambda vector
+lambda_raw <- data$Risk_Index  # ← use the column name in your CSV
+# Normalize around the persistence threshold λ = 1
+lambda_centered <- lambda_raw - 1
+lambda_scaled <- lambda_centered / max(abs(lambda_centered), na.rm = TRUE)
+summary(lambda_scaled)
+# Assign this to replace the risk index
+risk_index_raw <- lambda_scaled
+#risk_index_raw <- pmin(pmax(data$Risk_Index_Norm, 0.01), 1.0)
+
+base_features <- c("pdsi", "pr" , "soil", "tmmn","tmmx" ,"srad" , "dem" , "aet" , "slope","ndvi","Temp_Avg" )
+
+X <- as.data.frame(data[, ..base_features]) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+y <- as.factor(data$moth_class_label)
+
+# Train-Test Split
+train_index <- createDataPartition(y, p = 0.80, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+risk_train <- risk_index_raw[train_index]
+
+
+# ======================
+# 📈 Tunable Gain Functions (DROP-IN REPLACEMENT)
+# ======================
+
+# Step 1: Use data-driven anchors
+mu <- median(risk_train)
+sigma <- IQR(risk_train) / 2
+q40 <- quantile(risk_train, 0.4)
+q60 <- quantile(risk_train, 0.6)
+q80 <- quantile(risk_train, 0.8)
+
+# Step 2: Define tunable function constructors
+create_exp_gain <- function(thresh = 0.6, scale = 2) {
+  function(r) exp(scale * (r - thresh))
+}
+
+create_sigmoid_gain <- function(midpoint = 0.6, slope = 10) {
+  function(r) 1 / (1 + exp(-slope * (r - midpoint)))
+}
+
+create_step_gain <- function(low = 0.4, high = 0.7, low_w = 0.6, high_w = 1.4, mid_w = 1.0) {
+  function(r) ifelse(r < low, low_w, ifelse(r > high, high_w, mid_w))
+}
+
+create_triangular_gain <- function(a = 0.5, b = 0.8, peak = 0.65, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r <= a | r >= b, min_w,
+                     ifelse(r <= peak, max_w * (r - a) / (peak - a),
+                            max_w * (b - r) / (b - peak)))
+}
+
+create_trapezoidal_gain <- function(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75, max_w = 1.2, min_w = 0.5) {
+  function(r) ifelse(r < start | r > end, min_w,
+                     ifelse(r < flat_start, max_w * (r - start) / (flat_start - start),
+                            ifelse(r < flat_end, max_w, max_w * (end - r) / (end - flat_end))))
+}
+
+create_gaussian_gain <- function(mu = 0.65, sigma = 0.1) {
+  function(r) exp(-((r - mu)^2) / (2 * sigma^2))
+}
+
+# Step 3: Define weighting strategy list (using real data anchors)
+weighting_strategies <- list(
+  EXP = create_exp_gain(thresh = q60),
+  SIGMOID = create_sigmoid_gain(midpoint = mu),
+  STEP = create_step_gain(low = q40, high = q80),
+  TRIANGULAR = create_triangular_gain(a = q40, b = q80, peak = mu),
+  TRAPEZOID = create_trapezoidal_gain(start = 0.4, end = 0.9, flat_start = 0.55, flat_end = 0.75),
+  GAUSSIAN = create_gaussian_gain(mu = mu, sigma = sigma)
+)
+#Plotting
+# Prepare data
+r_seq <- seq(0, 1, 0.01)
+gain_df <- data.frame(r = r_seq)
+for (label in names(weighting_strategies)) {
+  gain_df[[label]] <- weighting_strategies[[label]](r_seq)
+}
+gain_df_long <- pivot_longer(gain_df, -r, names_to = "Function", values_to = "Weight")
+
+# Custom labels (a), (b), ...
+label_levels <- paste0("(", letters[1:length(unique(gain_df_long$Function))], ") ", unique(gain_df_long$Function))
+names(label_levels) <- unique(gain_df_long$Function)
+
+# Plot
+ggplot(gain_df_long, aes(x = r, y = Weight, color = Function, linetype = Function)) +
+  geom_line(linewidth = 1.2) +
+  facet_wrap(~ Function, ncol = 3, labeller = as_labeller(label_levels)) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash", "twodash", "longdash")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),                    # Remove inner lines
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),  # Thicker outer axis lines
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none",                        # No legend needed due to facets
+    plot.margin = unit(c(1, 1, 1, 1), "lines"),
+    panel.spacing = unit(1.5, "lines")
+  ) +
+  labs(
+    x = expression(Risk~Index~(italic(r))),
+    y = "Sample Weight"
+  )
+#allgraph together
+
+
+# Prepare data
+r_seq <- seq(0, 1, 0.01)
+gain_df <- data.frame(r = r_seq)
+for (label in names(weighting_strategies)) {
+  gain_df[[label]] <- weighting_strategies[[label]](r_seq)
+}
+gain_df_long <- pivot_longer(gain_df, -r, names_to = "Function", values_to = "Weight")
+
+# Plot all gain functions together
+ggplot(gain_df_long, aes(x = r, y = Weight, color = Function, linetype = Function)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash", "twodash", "longdash")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "right",
+    legend.title = element_blank(),
+    plot.margin = unit(c(1, 1, 1, 1), "lines")
+  ) +
+  labs(
+    x = expression(italic(Busseola ~fusca) ~Risk~Index~(italic(r))),
+    y = "Sample Weight"
+  )
+# ======================
+# 🚀 Fixed-Input Models (run ONCE only)
+# ======================
+results_df <- data.frame()
+
+# Random Forest
+set.seed(42)
+rf <- randomForest(x = X_train, y = y_train, ntree = 300, maxnodes = 10)
+pred_rf <- predict(rf, X_test)
+results_df <- rbind(results_df, data.frame(
+  Scenario = "BASE",
+  Model = "Random Forest",
+  Accuracy = mean(pred_rf == y_test),
+  Kappa = confusionMatrix(pred_rf, y_test)$overall["Kappa"]
+))
+
+# LightGBM
+set.seed(42)
+lgb_train <- lgb.Dataset(data = as.matrix(X_train), label = as.numeric(y_train) - 1)
+lgb_model <- lgb.train(params = list(objective = "multiclass", num_class = 3,
+                                     learning_rate = 0.1, max_depth = 10,
+                                     num_leaves = 31, seed = 42),
+                       data = lgb_train, nrounds = 300)
+pred_lgb <- predict(lgb_model, as.matrix(X_test))
+pred_lgb_label <- max.col(matrix(pred_lgb, ncol = 3, byrow = TRUE)) - 1
+results_df <- rbind(results_df, data.frame(
+  Scenario = "BASE",
+  Model = "LightGBM",
+  Accuracy = mean(pred_lgb_label == (as.numeric(y_test) - 1)),
+  Kappa = confusionMatrix(as.factor(pred_lgb_label), as.factor(as.numeric(y_test) - 1))$overall["Kappa"]
+))
+
+# Decision Tree (rpart)
+set.seed(42)
+tree_model <- rpart(y_train ~ ., data = X_train,
+                    method = "class", control = rpart.control(maxdepth = 10))
+pred_tree <- predict(tree_model, X_test, type = "class")
+results_df <- rbind(results_df, data.frame(
+  Scenario = "BASE",
+  Model = "Decision Tree",
+  Accuracy = mean(pred_tree == y_test),
+  Kappa = confusionMatrix(pred_tree, y_test)$overall["Kappa"]
+))
+# XGBoost (unweighted / normal)
+set.seed(42)
+dtrain_plain <- xgb.DMatrix(data = as.matrix(X_train), label = as.numeric(y_train) - 1)
+dtest <- xgb.DMatrix(data = as.matrix(X_test))
+xgb_model_plain <- xgboost(data = dtrain_plain, nrounds = 300, objective = "multi:softmax",
+                           num_class = 3, eval_metric = "mlogloss", max_depth = 10,
+                           eta = 0.1, subsample = 0.8, verbose = 0)
+
+pred_xgb_plain <- predict(xgb_model_plain, dtest)
+
+results_df <- rbind(results_df, data.frame(
+  Scenario = "BASE",
+  Model = "XGBoost",
+  Accuracy = mean(pred_xgb_plain == (as.numeric(y_test) - 1)),
+  Kappa = confusionMatrix(as.factor(pred_xgb_plain), as.factor(as.numeric(y_test) - 1))$overall["Kappa"]
+))
+# ======================
+# 🔁 Gain-Weighted XGBoost (only)
+# ======================
+for (label in names(weighting_strategies)) {
+  gain_func <- weighting_strategies[[label]]
+  sample_weights <- gain_func(risk_train)
+  
+  dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = as.numeric(y_train) - 1, weight = sample_weights)
+  dtest <- xgb.DMatrix(data = as.matrix(X_test))
+  set.seed(42)
+  xgb_model <- xgboost(data = dtrain, nrounds = 300, objective = "multi:softmax",
+                       num_class = 3, eval_metric = "mlogloss", max_depth = 10,
+                       eta = 0.1, subsample = 0.8, seed = 42, verbose = 0)
+  pred_xgb <- predict(xgb_model, dtest)
+  
+  results_df <- rbind(results_df, data.frame(
+    Scenario = label,
+    Model = paste0("LifeMLXGBoost (", label, ")"),
+    Accuracy = mean(pred_xgb == (as.numeric(y_test) - 1)),
+    Kappa = confusionMatrix(as.factor(pred_xgb), as.factor(as.numeric(y_test) - 1))$overall["Kappa"]
+  ))
+}
+
+# ======================
+# 📊 Output
+# ======================
+results_df <- results_df %>%
+  arrange(Scenario, desc(Accuracy))
+print(results_df)
+
+# Visualization
+ggplot(results_df, aes(x = Model, y = Accuracy, fill = Scenario)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(aes(y = Kappa), shape = 21, size = 3, color = "black",
+             position = position_dodge(width = 0.9)) +
+  labs(title = " ",
+       y = "Score", x = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+nrow(data)
